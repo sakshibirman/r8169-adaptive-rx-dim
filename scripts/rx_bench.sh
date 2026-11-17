@@ -19,23 +19,29 @@
 # usage: rx_bench.sh -l LABEL -p PEER [options]
 #   -l LABEL     configuration name, for example stock or static-low
 #   -p PEER      address of the peer machine (not needed for -w idle)
-#   -d DEV       network interface            (default enp3s0)
-#   -i IRQ       NIC interrupt number         (default: found in /proc/interrupts by device name)
-#   -o OUTDIR    output directory             (default results/baseline)
-#   -n RUNS      repetitions per cell         (default 5)
-#   -t SECS      seconds per run              (default 20)
-#   -w LIST      workloads: idle rr tcp udp   (default "idle rr tcp udp")
-#   -u RATES     UDP offered rates            (default "100M 300M 600M 900M")
+#   -d DEV       network interface                 (default enp3s0)
+#   -i IRQ       NIC interrupt number              (default: found in /proc/interrupts by device name)
+#   -o OUTDIR    output directory                  (default results/phase4)
+#   -n RUNS      repetitions per cell              (default 5)
+#   -t SECS      seconds per run                   (default 20)
+#   -w LIST      workloads: idle rr rrp tcp udp udps (default "idle rr rrp tcp udp udps")
+#   -u RATES     UDP offered rates                 (default "100M 300M 600M 900M")
+#   -s SRATES    Small-packet UDP offered rates    (default "50M 100M 150M 200M")
+#   -L LEN       Small-packet UDP payload bytes    (default 100)
+#   -P PARALLEL  Parallel streams for rrp          (default 8)
 
 set -u
 
 DEV=enp3s0
 IRQ=""
-OUTDIR=results/baseline
+OUTDIR=results/phase4
 RUNS=5
 SECS=20
-WORKLOADS="idle rr tcp udp"
+WORKLOADS="idle rr rrp tcp udp udps"
 UDP_RATES="100M 300M 600M 900M"
+UDPS_RATES="50M 100M 150M 200M"
+UDP_LEN=100
+RRP_PROCS=8
 LABEL=""
 PEER=""
 
@@ -44,7 +50,7 @@ usage() {
 	exit 2
 }
 
-while getopts "l:p:d:i:o:n:t:w:u:h" opt; do
+while getopts "l:p:d:i:o:n:t:w:u:s:L:P:h" opt; do
 	case $opt in
 	l) LABEL=$OPTARG ;;
 	p) PEER=$OPTARG ;;
@@ -55,6 +61,9 @@ while getopts "l:p:d:i:o:n:t:w:u:h" opt; do
 	t) SECS=$OPTARG ;;
 	w) WORKLOADS=$OPTARG ;;
 	u) UDP_RATES=$OPTARG ;;
+	s) UDPS_RATES=$OPTARG ;;
+	L) UDP_LEN=$OPTARG ;;
+	P) RRP_PROCS=$OPTARG ;;
 	*) usage ;;
 	esac
 done
@@ -71,9 +80,6 @@ fi
 
 INTERRUPTS_FILE=${INTERRUPTS_FILE:-/proc/interrupts}
 
-# The row of /proc/interrupts named after the device is the reliable
-# source. "device/irq" in sysfs is the legacy line for MSI-X devices
-# such as this NIC and points at an unrelated interrupt.
 if [ -z "$IRQ" ]; then
 	IRQ=$(awk -v d="$DEV" '$NF == d { sub(":", "", $1); print $1; exit }' "$INTERRUPTS_FILE")
 fi
@@ -93,8 +99,8 @@ for tool in awk python3; do
 done
 for w in $WORKLOADS; do
 	case $w in
-	rr) command -v netperf >/dev/null || { echo "missing tool: netperf" >&2; exit 1; } ;;
-	tcp | udp) command -v iperf3 >/dev/null || { echo "missing tool: iperf3" >&2; exit 1; } ;;
+	rr | rrp) command -v netperf >/dev/null || { echo "missing tool: netperf" >&2; exit 1; } ;;
+	tcp | udp | udps) command -v iperf3 >/dev/null || { echo "missing tool: iperf3" >&2; exit 1; } ;;
 	idle) ;;
 	*) echo "unknown workload: $w" >&2; exit 2 ;;
 	esac
@@ -121,13 +127,10 @@ softirq_net_rx() {
 	awk '$1 == "NET_RX:" { s = 0; for (i = 2; i <= NF; i++) s += $i; print s }' /proc/softirqs
 }
 
-# prints "busy_jiffies total_jiffies" for all CPUs together
 cpu_times() {
 	awk '$1 == "cpu" { idle = $5 + $6; t = 0; for (i = 2; i <= 9; i++) t += $i; print t - idle, t }' /proc/stat
 }
 
-# snapshot_cpus FILE: per-CPU interrupt counts of the NIC row ("IRQ ..."),
-# then the per-CPU lines of /proc/stat
 snapshot_cpus() {
 	{
 		awk -v irq="$IRQ:" '$1 == irq { printf "IRQ"; for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) printf " %s", $i; print "" }' "$INTERRUPTS_FILE"
@@ -135,10 +138,6 @@ snapshot_cpus() {
 	} > "$1"
 }
 
-# irq_cpu_stats BEFORE AFTER: "cpu,busy_pct,softirq_pct" for the CPU that
-# took the NIC interrupts during the run. CPU numbers are for one CPU, so
-# 100 means that CPU was fully busy (the all-CPU figure is divided by the
-# number of CPUs and hides this).
 irq_cpu_stats() {
 	python3 - "$1" "$2" <<'PY'
 import sys
@@ -181,9 +180,9 @@ try:
     e = json.load(open(sys.argv[1]))["end"]
     s = e.get("sum", {})
     if "lost_percent" in s:
-        # UDP (iperf3 3.16 also reports sum_received for UDP, so test this first)
-        print("mbit=%.1f;loss_pct=%.4f;jitter_ms=%.4f" % (
-            s["bits_per_second"] / 1e6, s.get("lost_percent", 0), s.get("jitter_ms", 0)))
+        pps = s.get("packets", 0) / max(s.get("seconds", 1.0), 1e-6)
+        print("mbit=%.1f;loss_pct=%.4f;jitter_ms=%.4f;pps=%.0f" % (
+            s["bits_per_second"] / 1e6, s.get("lost_percent", 0), s.get("jitter_ms", 0), pps))
     else:
         print("mbit=%.1f" % (e["sum_received"]["bits_per_second"] / 1e6))
 except Exception:
@@ -195,13 +194,54 @@ parse_netperf() {
 	tail -n 1 "$1" | awk -F, '{ printf "tps=%s;mean_lat_us=%s;min_lat_us=%s;max_lat_us=%s;stddev_us=%s\n", $1, $2, $3, $4, $5 }'
 }
 
+parse_netperf_parallel() {
+	python3 - "$1" <<'PY'
+import sys
+tps_list, mean_list, min_list, max_list = [], [], [], []
+try:
+    for line in open(sys.argv[1]):
+        parts = line.strip().split(",")
+        if len(parts) >= 5:
+            tps_list.append(float(parts[0]))
+            mean_list.append(float(parts[1]))
+            min_list.append(float(parts[2]))
+            max_list.append(float(parts[3]))
+    if not tps_list:
+        print("parse_error")
+    else:
+        print("tps=%.2f;mean_lat_us=%.2f;min_lat_us=%.2f;max_lat_us=%.2f;streams=%d" % (
+            sum(tps_list), sum(mean_list)/len(mean_list), min(min_list), max(max_list), len(tps_list)))
+except Exception:
+    print("parse_error")
+PY
+}
+
 parse_none() {
 	echo "-"
 }
 
+run_rrp() {
+	local peer=$1 secs=$2 procs=$3
+	local pids="" rc=0 tmpdir
+	tmpdir=$(mktemp -d)
+	for i in $(seq 1 "$procs"); do
+		netperf -H "$peer" -t TCP_RR -l "$secs" -P 0 -- -r 64,64 \
+			-o THROUGHPUT,MEAN_LATENCY,MIN_LATENCY,MAX_LATENCY,STDDEV_LATENCY \
+			> "$tmpdir/p_$i.txt" 2>&1 &
+		pids="$pids $!"
+	done
+	for pid in $pids; do
+		wait "$pid" || rc=$?
+	done
+	for i in $(seq 1 "$procs"); do
+		tail -n 1 "$tmpdir/p_$i.txt"
+	done
+	rm -rf "$tmpdir"
+	return "$rc"
+}
+
 # ---- one measured run -----------------------------------------------
 
-# measure WORKLOAD PARAM RUN PARSER COMMAND...
 measure() {
 	local workload=$1 param=$2 run=$3 parser=$4
 	shift 4
@@ -239,13 +279,11 @@ measure() {
 	fi
 	echo "$LABEL,$workload,$param,$run,$rates,$cpustats,$status,$result" | tee -a "$CSV"
 
-	# let the servers on the peer and the NIC settle before the next run
 	sleep 2
 }
 
 # ---- setup snapshot -------------------------------------------------
 
-# A wrong interrupt number would give a silent 0, so fail early instead.
 if [ -z "$(irq_total)" ]; then
 	echo "interrupt $IRQ not found in $INTERRUPTS_FILE; find it with: grep $DEV /proc/interrupts" >&2
 	exit 1
@@ -299,12 +337,22 @@ for w in $WORKLOADS; do
 				netperf -H "$PEER" -t TCP_RR -l "$SECS" -P 0 -- -r 64,64 \
 				-o THROUGHPUT,MEAN_LATENCY,MIN_LATENCY,MAX_LATENCY,STDDEV_LATENCY
 			;;
+		rrp)
+			measure rrp "${RRP_PROCS}x64B" "$run" parse_netperf_parallel \
+				run_rrp "$PEER" "$SECS" "$RRP_PROCS"
+			;;
 		tcp)
 			measure tcp bulk "$run" parse_iperf iperf3 -c "$PEER" -R -t "$SECS" -J
 			;;
 		udp)
 			for rate in $UDP_RATES; do
 				measure udp "$rate" "$run" parse_iperf iperf3 -c "$PEER" -R -u -b "$rate" -t "$SECS" -J
+			done
+			;;
+		udps)
+			for rate in $UDPS_RATES; do
+				measure udps "${rate}_${UDP_LEN}B" "$run" parse_iperf \
+					iperf3 -c "$PEER" -R -u -b "$rate" -l "$UDP_LEN" -t "$SECS" -J
 			done
 			;;
 		esac
